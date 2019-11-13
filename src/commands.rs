@@ -21,8 +21,14 @@ pub fn glcm(path: PathBuf) {
         let branch_tip_commit_id = reference.target().unwrap();
         let branch_tip_commit = repository.find_commit(branch_tip_commit_id).unwrap();
         let branch_tip_tree = branch_tip_commit.tree().unwrap();
-        let tree = dbg!(Tree::new(&repository, &branch_tip_tree));
-        branch_tip_commit.parent_ids();
+        let tree = Tree::new(&repository, &branch_tip_tree);
+
+        let mut revwalk = repository.revwalk().unwrap();
+        revwalk.push(branch_tip_commit_id).unwrap();
+        let older_commit_id = dbg!(revwalk.nth(1).unwrap().unwrap());
+        let older_commit = repository.find_commit(older_commit_id).unwrap();
+        let older_tree = Tree::new(&repository, &older_commit.tree().unwrap());
+        let tree_diff = dbg!(tree.diff(&older_tree));
     }
 }
 
@@ -40,7 +46,8 @@ struct DisplayTreeItem {
 }
 
 // TODO: !
-struct DiffTree {
+#[derive(Debug)]
+struct TreeDiff {
     changed: Tree,
     unchanged: Tree,
 }
@@ -83,8 +90,11 @@ impl Tree {
         Self { items }
     }
 
-    /// Returns `(changed, unchanged)`
-    fn diff(&self, other: &Tree) -> DiffTree {
+    /// Returns items as either `changed` or `unchanged`.
+    ///
+    /// This is a shallow operation. You have to call `Tree.diff` manually on
+    /// directories to diff the directory's contents.
+    fn diff(&self, other: &Tree) -> TreeDiff {
         let mut unchanged = self.items.clone();
         let mut changed = Vec::with_capacity(unchanged.len());
 
@@ -96,23 +106,20 @@ impl Tree {
                     && other_item.entry().filemode() == item.entry().filemode()
             });
 
-            if !item.filemode().is_dir() {
-                let is_same_object = other_item
-                    .map(|other_item| other_item.entry().id() == item.entry().id())
-                    .unwrap_or(false);
-                if !is_same_object {
-                    changed.push(unchanged.remove(i));
-                } else {
-                    i += 1;
-                }
+            let is_same_object = other_item
+                .map(|other_item| other_item.entry().id() == item.entry().id())
+                .unwrap_or(false);
+            if !is_same_object {
+                changed.push(unchanged.remove(i));
             } else {
-                // TODO: !
-
-                // item.diff()
+                i += 1;
             }
         }
 
-        unimplemented!()
+        TreeDiff {
+            changed: Tree { items: changed },
+            unchanged: Tree { items: unchanged },
+        }
     }
 }
 
