@@ -1,6 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    path::{self, Path, PathBuf},
+};
 
-use git2::{BranchType, ErrorCode, Oid, ReferenceType, Repository, TreeEntry};
+use git2::{BranchType, ErrorCode, ObjectType, Oid, ReferenceType, Repository, TreeEntry};
 
 // macro_rules! unwrap_result_or_else {
 //     ($result:expr, $err:ident, $else_:expr) => {
@@ -19,149 +22,129 @@ pub fn glcm(path: PathBuf) {
         let reference = master_branch.get();
         assert_eq!(reference.kind(), Some(ReferenceType::Direct));
         let branch_tip_commit_id = reference.target().unwrap();
-        let branch_tip_commit = repository.find_commit(branch_tip_commit_id).unwrap();
-        let branch_tip_tree = branch_tip_commit.tree().unwrap();
-        let tree = Tree::new(&repository, &branch_tip_tree);
-
-        let mut revwalk = repository.revwalk().unwrap();
-        revwalk.push(branch_tip_commit_id).unwrap();
-        let older_commit_id = dbg!(revwalk.nth(1).unwrap().unwrap());
-        let older_commit = repository.find_commit(older_commit_id).unwrap();
-        let older_tree = Tree::new(&repository, &older_commit.tree().unwrap());
-        let tree_diff = dbg!(tree.diff(&older_tree));
+        let display_tree = DisplayTree::new(&path, &repository, branch_tip_commit_id);
+        println!("{}", path.display());
+        for item in display_tree.items.iter() {
+            println!(
+                "    {:13}{:20}{:44}{}",
+                format!("{:?}", item.filemode),
+                item.name,
+                item.last_commit_id,
+                item.last_commit_message.trim()
+            );
+        }
     }
-}
-
-// TODO: !
-struct DisplayTree {
-    items: Vec<DisplayTreeItem>,
-}
-
-// TODO: !
-struct DisplayTreeItem {
-    path: PathBuf,
-    name: String,
-    last_commit_id: Oid,
-    last_commit_message: String,
 }
 
 // TODO: !
 #[derive(Debug)]
-struct TreeDiff {
-    changed: Tree,
-    unchanged: Tree,
+struct DisplayTree {
+    items: Vec<DisplayTreeItem>,
 }
 
-// TODO: Investigate how much should be borrowed
-#[derive(Clone, Debug)]
-struct Tree {
-    items: Vec<TreeItem>,
-}
+impl DisplayTree {
+    /// # Panics
+    ///
+    /// This function will panice if `path` points to something other than a directory
+    pub fn new<P>(path: P, repository: &Repository, commit_id: Oid) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        let path = path.as_ref();
+        let invalid_prefix = path.components().take(1).find(|component| match component {
+            path::Component::Prefix(_)
+            | path::Component::RootDir
+            | path::Component::CurDir
+            | path::Component::ParentDir => true,
+            path::Component::Normal(_) => false,
+        });
+        let normalized_path = invalid_prefix
+            .map(|invalid_prefix| path.strip_prefix(invalid_prefix).unwrap())
+            .unwrap_or(path);
 
-impl Tree {
-    fn new(repository: &Repository, tree: &git2::Tree) -> Self {
-        let items = {
-            let tree_iter = tree.iter();
-            let size_hint = {
-                let (lower, upper) = tree_iter.size_hint();
-                upper.unwrap_or(lower)
-            };
-            let mut items = Vec::with_capacity(size_hint);
-            for entry in tree_iter {
-                let filemode = FileMode::from_i32(entry.filemode()).unwrap();
-                if filemode.is_dir() {
-                    let inner_tree = Tree::new(
-                        repository,
-                        &entry.to_object(repository).unwrap().into_tree().unwrap(),
-                    );
-                    items.push(TreeItem::Directory(entry.to_owned(), inner_tree));
-                } else if filemode.is_file() {
-                    items.push(TreeItem::File(entry.to_owned()));
-                } else if filemode.is_symlink() {
-                    items.push(TreeItem::Symlink(entry.to_owned()));
-                } else if filemode.is_gitlink() {
-                    items.push(TreeItem::Gitlink(entry.to_owned()));
+        let mut revwalk = repository.revwalk().unwrap();
+        revwalk.push(commit_id).unwrap();
+
+        let mut oldest_commit_for_object = HashMap::new();
+
+        for older_commit_id in revwalk {
+            let older_commit_id = older_commit_id.unwrap();
+            let older_commit = repository.find_commit(older_commit_id).unwrap();
+            let older_tree = older_commit.tree().unwrap();
+            let older_target_tree = {
+                if normalized_path == Path::new("") {
+                    older_tree
                 } else {
-                    unreachable!()
+                    older_tree
+                        .get_path(normalized_path)
+                        .unwrap()
+                        .to_object(repository)
+                        .unwrap()
+                        .peel_to_tree()
+                        .unwrap()
+                }
+            };
+            for entry in older_target_tree.iter() {
+                if entry.kind() == Some(ObjectType::Blob) || entry.kind() == Some(ObjectType::Tree)
+                {
+                    oldest_commit_for_object.insert(entry.id(), older_commit_id);
                 }
             }
-            items
+        }
+
+        let commit = repository.find_commit(commit_id).unwrap();
+        let tree = commit.tree().unwrap();
+
+        let target_tree = {
+            if normalized_path == Path::new("") {
+                tree
+            } else {
+                tree.get_path(normalized_path)
+                    .unwrap()
+                    .to_object(repository)
+                    .unwrap()
+                    .peel_to_tree()
+                    .unwrap()
+            }
         };
+
+        let items = target_tree
+            .iter()
+            .filter_map(|entry| {
+                if entry.kind() == Some(ObjectType::Blob) || entry.kind() == Some(ObjectType::Tree)
+                {
+                    Some(DisplayTreeItem::new(
+                        repository,
+                        *oldest_commit_for_object.get(&entry.id()).unwrap(),
+                        entry,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         Self { items }
     }
-
-    /// Returns items as either `changed` or `unchanged`.
-    ///
-    /// This is a shallow operation. You have to call `Tree.diff` manually on
-    /// directories to diff the directory's contents.
-    fn diff(&self, other: &Tree) -> TreeDiff {
-        let mut unchanged = self.items.clone();
-        let mut changed = Vec::with_capacity(unchanged.len());
-
-        let mut i = 0;
-        while i != unchanged.len() {
-            let item = &mut unchanged[i];
-            let other_item = other.items.iter().find(|other_item| {
-                other_item.entry().name_bytes() == item.entry().name_bytes()
-                    && other_item.entry().filemode() == item.entry().filemode()
-            });
-
-            let is_same_object = other_item
-                .map(|other_item| other_item.entry().id() == item.entry().id())
-                .unwrap_or(false);
-            if !is_same_object {
-                changed.push(unchanged.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-
-        TreeDiff {
-            changed: Tree { items: changed },
-            unchanged: Tree { items: unchanged },
-        }
-    }
 }
 
-#[derive(Clone)]
-enum TreeItem {
-    Directory(TreeEntry<'static>, Tree),
-    File(TreeEntry<'static>),
-    Symlink(TreeEntry<'static>),
-    Gitlink(TreeEntry<'static>),
+// TODO: !
+#[derive(Debug)]
+struct DisplayTreeItem {
+    name: String,
+    last_commit_id: Oid,
+    last_commit_message: String,
+    filemode: FileMode,
 }
 
-impl TreeItem {
-    pub fn filemode(&self) -> FileMode {
-        match self {
-            Self::Directory(_, _) => FileMode::Directory,
-            Self::File(entry) => FileMode::from_i32(entry.filemode()).unwrap(),
-            Self::Symlink(_) => FileMode::Symlink,
-            Self::Gitlink(_) => FileMode::Gitlink,
-        }
-    }
-
-    pub fn entry(&self) -> &TreeEntry<'static> {
-        match self {
-            Self::Directory(entry, _) => entry,
-            Self::File(entry) => entry,
-            Self::Symlink(entry) => entry,
-            Self::Gitlink(entry) => entry,
-        }
-    }
-}
-
-impl core::fmt::Debug for TreeItem {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            Self::Directory(entry, tree) => f
-                .debug_tuple("Directory")
-                .field(&entry.name())
-                .field(tree)
-                .finish(),
-            Self::File(entry) => f.debug_tuple("File").field(&entry.name()).finish(),
-            Self::Symlink(entry) => f.debug_tuple("Symlink").field(&entry.name()).finish(),
-            Self::Gitlink(entry) => f.debug_tuple("Gitlink").field(&entry.name()).finish(),
+impl DisplayTreeItem {
+    fn new(repository: &Repository, last_commit_id: Oid, entry: TreeEntry<'_>) -> Self {
+        let last_commit = repository.find_commit(last_commit_id).unwrap();
+        Self {
+            name: entry.name().unwrap().to_string(),
+            last_commit_id,
+            last_commit_message: last_commit.message().unwrap().to_string(),
+            filemode: FileMode::from_i32(entry.filemode()).unwrap(),
         }
     }
 }
@@ -201,6 +184,7 @@ impl FileMode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_file(self) -> bool {
         match self {
             Self::File | Self::GroupWriteableFile | Self::Executable => true,
@@ -208,14 +192,17 @@ impl FileMode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_dir(self) -> bool {
         Self::Directory == self
     }
 
+    #[allow(dead_code)]
     pub fn is_symlink(self) -> bool {
         Self::Symlink == self
     }
 
+    #[allow(dead_code)]
     pub fn is_gitlink(self) -> bool {
         Self::Gitlink == self
     }
